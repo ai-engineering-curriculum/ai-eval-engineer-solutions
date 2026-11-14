@@ -384,6 +384,12 @@ def report_for_field(
     spec: FieldSpec,
     coefficient: str,
 ) -> FieldReport:
+    # Multi-label fields (e.g. exercise-01's `safety_concern`, which exports
+    # list values like ["pii_leak"]) and the mean-Jaccard coefficient do not
+    # fit a (row, col) integer matrix. Route them to the set-based path
+    # *before* calling build_matrix, so list values never reach the matrix
+    # builder (which would raise TypeError) and jaccard_mean never falls
+    # through the kappa ladder below (which would return NaN).
     if spec.kind == "multi_label" or coefficient == "jaccard_mean":
         return _report_multi_label(annotations, spec)
 
@@ -401,7 +407,10 @@ def report_for_field(
     elif coefficient == "cohen":
         cc = cohens_kappa(matrix)
     else:
-        cc = float("nan")
+        raise ValueError(
+            f"unknown coefficient {coefficient!r} for field {spec.field_id!r}; "
+            f"expected one of krippendorff, fleiss, cohen, jaccard_mean."
+        )
 
     prev, bias = (None, None)
     if k == 2 and len(annotators) == 2:

@@ -317,6 +317,20 @@ def score_cluster(
     novelty = _novelty(c.centroid, historical_centroids)
     recency = math.exp(-(now_ns - c.last_seen_ns) / 1e9 / weights.recency_halflife_s)
 
+    # Critical-harm floor: a confirmed safety hit on even one user still
+    # pages — short-circuit the weighted sum before the threshold ladder.
+    # A single-user PII leak scores ~0.75 under the default weights
+    # (blast≈1/DAU), which would otherwise land in the 24h P1 queue rather
+    # than the P0 2h/paged queue. Exiting here keeps that path immune to
+    # future weight or threshold edits.
+    if harm >= weights.critical_harm_floor:
+        return ScoredCluster(
+            cluster=c, harm_score=harm, blast_radius=blast,
+            novelty=novelty, recency=recency,
+            severity=max(weights.thresholds["P0"], weights.w_harm * harm),
+            priority="P0",
+        )
+
     severity = (
         weights.w_harm * harm
         + weights.w_blast * blast
@@ -325,22 +339,11 @@ def score_cluster(
     )
     severity = min(1.0, max(0.0, severity))
 
-    # Critical-harm floor: a confirmed safety hit on even one user still
-    # pages. Without this, a novel PII-leak with blast≈1/DAU scores ~0.75
-    # and routes to the 24h P1 queue instead of the P0 2h/paged queue.
-    # We both bump severity to the P0 threshold *and* pin the priority, so
-    # a future threshold edit can never silently demote this path.
-    critical = harm >= weights.critical_harm_floor
-    if critical:
-        severity = max(severity, weights.thresholds["P0"])
-
     priority = "P3"
     for name, thr in sorted(weights.thresholds.items(), key=lambda x: -x[1]):
         if severity >= thr:
             priority = name
             break
-    if critical:
-        priority = "P0"
 
     return ScoredCluster(
         cluster=c, harm_score=harm, blast_radius=blast,

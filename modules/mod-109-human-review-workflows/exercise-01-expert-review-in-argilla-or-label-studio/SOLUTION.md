@@ -245,11 +245,17 @@ class ArgillaReviewAdapter:
         return len(payload)
 
     def pull_annotations(self) -> list[dict[str, Any]]:
+        """Return the submitted responses with the rubric_version that was
+        frozen into the record at ingest time (not the current YAML).
+        Exercise-03 keys agreement studies by rubric_version, so a rubric
+        bump must not retroactively relabel historical annotations."""
         ds = rg.FeedbackDataset.from_argilla(self._dataset_name)
         current_version = self._schema["rubric_version"]
         out: list[dict[str, Any]] = []
         for r in ds.records:
             record_meta = r.metadata or {}
+            # Prefer the per-record metadata; fall back to the current YAML
+            # only for legacy records ingested before the metadata field existed.
             rubric_version = record_meta.get("rubric_version") or current_version
             for response in r.responses or []:
                 out.append({
