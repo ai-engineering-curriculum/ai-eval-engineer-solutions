@@ -538,6 +538,60 @@ def test_ordinal_penalises_far_disagreement():
     assert ordinal < 0.2, "far-apart ordinal disagreements must tank alpha"
 ```
 
+### 2.7 `tests/test_jaccard_multi_label.py`
+
+```python
+"""Regression guard: the exercise-01 exporter writes `safety_concern` as a
+list (e.g. `["pii_leak"]`). The per-field report must accept that shape and
+return a real Jaccard number, not NaN or TypeError."""
+import pytest
+
+from iaa.report import build_matrix, report_for_field
+from iaa.schema import Annotation, FieldSpec
+
+
+SAFETY = FieldSpec(
+    field_id="safety_concern",
+    kind="multi_label",
+    categories=("pii_leak", "unsafe_advice", "policy_violation", "none"),
+)
+
+
+def _ann(trace: str, who: str, labels):
+    return Annotation(
+        trace_id=trace, annotator_id=who, rubric_version="v1.0",
+        values={"safety_concern": labels}, submitted_ns=0,
+    )
+
+
+def test_build_matrix_rejects_list_values_with_actionable_error():
+    """build_matrix is for scalar categoricals; list values must raise a
+    clear TypeError naming the field, not a bare 'unhashable type'."""
+    anns = [_ann("t1", "r1", ["pii_leak"]), _ann("t1", "r2", ["pii_leak"])]
+    with pytest.raises(TypeError, match="safety_concern"):
+        build_matrix(anns, "safety_concern", SAFETY.categories)
+
+
+def test_jaccard_mean_scores_exercise_01_list_shape():
+    """Two raters, identical list labels — must score 1.0, not NaN."""
+    anns = [
+        _ann("t1", "r1", ["pii_leak"]), _ann("t1", "r2", ["pii_leak"]),
+        _ann("t2", "r1", ["none"]),     _ann("t2", "r2", ["none"]),
+    ]
+    rep = report_for_field(anns, SAFETY, coefficient="jaccard_mean")
+    assert rep.coefficient_name == "jaccard_mean"
+    assert rep.chance_corrected == 1.0, "perfect-agreement multi-label must be 1.0"
+
+
+def test_jaccard_mean_partial_overlap_is_between_zero_and_one():
+    anns = [
+        _ann("t1", "r1", ["pii_leak", "unsafe_advice"]),
+        _ann("t1", "r2", ["pii_leak"]),
+    ]
+    rep = report_for_field(anns, SAFETY, coefficient="jaccard_mean")
+    assert 0.0 < rep.chance_corrected < 1.0
+```
+
 ## 3. Validation steps
 
 1. **Install + run tests**: `pip install -e . && pytest -q tests/`. All coefficient tests pass; the kappa-paradox test explicitly verifies that raw agreement 0.98 can produce a kappa under 0.6 at extreme prevalence.

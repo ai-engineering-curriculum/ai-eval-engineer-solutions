@@ -382,6 +382,34 @@ def test_at_least_two_annotators_per_record():
         s = yaml.safe_load(f)
     assert s["roles"]["annotator"]["assignments_per_record"] >= 2, \
         "need >= 2 annotators to compute IAA in exercise-03"
+
+
+def test_canonical_export_preserves_rubric_version(tmp_path, monkeypatch):
+    """Exercise-03 keys agreement studies by rubric_version. The canonical
+    export must carry the rubric version from `review_schema.yaml` through
+    to `annotations.jsonl`, not just the transport `schema_version`."""
+    import json
+    from pipelines import export
+
+    class _StubAdapter:
+        def __init__(self, *_a, **_k): pass
+        def pull_annotations(self):
+            return [{
+                "trace_id": "t1", "annotator_id": "r1",
+                "rubric_version": "v1.0", "submitted_ns": 1,
+                "values": {"helpfulness": "yes", "grounded": "grounded",
+                           "safety_concern": [], "severity": None,
+                           "rationale": ""},
+                "status": "submitted",
+            }]
+
+    monkeypatch.setattr(export, "ArgillaReviewAdapter", _StubAdapter)
+    out = tmp_path / "annotations.jsonl"
+    export.main(out, cfg=None, schema_path="schema/review_schema.yaml")
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["rubric_version"] == "v1.0", \
+        "rubric_version must survive the ingest→pull→export roundtrip"
+    assert row["schema_version"] == export.CANONICAL_SCHEMA_VERSION
 ```
 
 ## 3. Validation steps

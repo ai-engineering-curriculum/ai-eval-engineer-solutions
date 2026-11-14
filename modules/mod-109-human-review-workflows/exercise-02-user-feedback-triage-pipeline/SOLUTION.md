@@ -328,7 +328,10 @@ def score_cluster(
     # Critical-harm floor: a confirmed safety hit on even one user still
     # pages. Without this, a novel PII-leak with blast≈1/DAU scores ~0.75
     # and routes to the 24h P1 queue instead of the P0 2h/paged queue.
-    if harm >= weights.critical_harm_floor:
+    # We both bump severity to the P0 threshold *and* pin the priority, so
+    # a future threshold edit can never silently demote this path.
+    critical = harm >= weights.critical_harm_floor
+    if critical:
         severity = max(severity, weights.thresholds["P0"])
 
     priority = "P3"
@@ -336,6 +339,8 @@ def score_cluster(
         if severity >= thr:
             priority = name
             break
+    if critical:
+        priority = "P0"
 
     return ScoredCluster(
         cluster=c, harm_score=harm, blast_radius=blast,
