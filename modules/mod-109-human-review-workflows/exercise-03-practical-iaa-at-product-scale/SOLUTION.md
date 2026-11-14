@@ -249,8 +249,10 @@ def prevalence_and_bias_index(matrix: Sequence[Sequence[int | None]]) -> tuple[f
 """Per-field and per-reviewer reports. Both are dataclasses; the CLI writes
 JSON and optionally renders a markdown summary."""
 from __future__ import annotations
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Callable
+from itertools import combinations
+from typing import Any, Callable
 import yaml
 
 from .schema import Annotation, FieldSpec
@@ -288,7 +290,13 @@ class ReviewerReport:
 def build_matrix(
     annotations: list[Annotation], field_id: str, categories: tuple[str, ...]
 ) -> tuple[list[list[int | None]], list[str], list[str]]:
-    """Return (matrix, trace_ids, annotator_ids). Matrix rows=items, cols=annotators."""
+    """Return (matrix, trace_ids, annotator_ids). Matrix rows=items, cols=annotators.
+
+    Expects scalar categorical values (binary / nominal / ordinal). Multi-label
+    fields export list values; those are not representable in a (row, col)
+    integer matrix and must be routed through `_report_multi_label` instead.
+    Raised explicitly rather than silently skipped so a mis-configured
+    coefficient is caught at report time, not as a NaN in production."""
     annotators = sorted({a.annotator_id for a in annotations})
     traces = sorted({a.trace_id for a in annotations})
     idx_ann = {a: i for i, a in enumerate(annotators)}
@@ -297,10 +305,78 @@ def build_matrix(
     m: list[list[int | None]] = [[None] * len(annotators) for _ in traces]
     for a in annotations:
         v = a.values.get(field_id)
-        if v is None or v not in cat_idx:
+        if v is None:
+            continue
+        if isinstance(v, (list, set, tuple)):
+            raise TypeError(
+                f"field {field_id!r} on trace {a.trace_id!r} is multi-valued "
+                f"({v!r}); use jaccard_mean (not a categorical matrix)."
+            )
+        if v not in cat_idx:
             continue
         m[idx_trace[a.trace_id]][idx_ann[a.annotator_id]] = cat_idx[v]
     return m, traces, annotators
+
+
+def _as_label_set(v: Any) -> frozenset:
+    """Normalise a multi-label value to a hashable set. Accepts list/tuple/set
+    (common exporter shapes) and bare scalars (single-choice collapsed to a set)."""
+    if v is None:
+        return frozenset()
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return frozenset(v)
+    return frozenset([v])
+
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def _report_multi_label(annotations: list[Annotation], spec: FieldSpec) -> FieldReport:
+    """Mean-Jaccard agreement over per-item annotator pairs. Each annotator
+    contributes a set of labels per trace; for every trace with >= 2 raters we
+    average the pair-wise Jaccard, then average across traces."""
+    by_trace: dict[str, list[tuple[str, frozenset]]] = defaultdict(list)
+    annotators: set[str] = set()
+    for a in annotations:
+        if spec.field_id not in a.values:
+            continue
+        by_trace[a.trace_id].append((a.annotator_id, _as_label_set(a.values[spec.field_id])))
+        annotators.add(a.annotator_id)
+
+    per_item_jaccard: list[float] = []
+    per_item_exact: list[bool] = []
+    low: list[str] = []
+    for trace_id, pairs in by_trace.items():
+        if len(pairs) < 2:
+            continue
+        scores = [_jaccard(a, b) for (_, a), (_, b) in combinations(pairs, 2)]
+        if not scores:
+            continue
+        avg = sum(scores) / len(scores)
+        per_item_jaccard.append(avg)
+        per_item_exact.append(avg == 1.0)
+        if avg < 1.0:
+            low.append(trace_id)
+
+    if per_item_jaccard:
+        mean_j = sum(per_item_jaccard) / len(per_item_jaccard)
+        raw = sum(per_item_exact) / len(per_item_exact)
+    else:
+        mean_j = float("nan")
+        raw = float("nan")
+
+    return FieldReport(
+        field_id=spec.field_id,
+        rubric_version=annotations[0].rubric_version,
+        n_items=len(by_trace), n_raters=len(annotators),
+        raw_agreement=raw, chance_corrected=mean_j,
+        coefficient_name="jaccard_mean",
+        prevalence_index=None, bias_index=None,
+        low_agreement_items=low,
+    )
 
 
 def report_for_field(
@@ -308,6 +384,9 @@ def report_for_field(
     spec: FieldSpec,
     coefficient: str,
 ) -> FieldReport:
+    if spec.kind == "multi_label" or coefficient == "jaccard_mean":
+        return _report_multi_label(annotations, spec)
+
     matrix, traces, annotators = build_matrix(
         annotations, spec.field_id, spec.categories,
     )
@@ -352,10 +431,22 @@ def _row_is_split(row: list[int | None]) -> bool:
 Each row references the trace and names the two annotators + their values."""
 from __future__ import annotations
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 from .schema import Annotation
+
+
+def _hashable(v: Any) -> Any:
+    """Normalise so multi-label list values compare equal regardless of order
+    and can live in a set for disagreement detection."""
+    if isinstance(v, list):
+        return tuple(sorted(v, key=lambda x: (x is None, str(x))))
+    if isinstance(v, set):
+        return frozenset(v)
+    return v
 
 
 def emit_adjudication(
@@ -367,28 +458,35 @@ def emit_adjudication(
     for a in annotations:
         by_trace[a.trace_id].append(a)
 
-    written = 0
-    with out_path.open("w") as f:
-        for trace_id, anns in by_trace.items():
-            if len(anns) < 2:
-                continue
-            disagreements: dict[str, list[tuple[str, object]]] = {}
-            for field_id in fields_to_adjudicate:
-                values = [(a.annotator_id, a.values.get(field_id)) for a in anns]
-                distinct = {v for _, v in values if v is not None}
-                if len(distinct) > 1:
-                    disagreements[field_id] = values
-            if not disagreements:
-                continue
-            f.write(json.dumps({
-                "trace_id": trace_id,
-                "rubric_version": anns[0].rubric_version,
-                "disagreements": disagreements,
-                "queue": "review-adjudication",
-                "sla_hours": 48,
-            }, sort_keys=True, default=str) + "\n")
-            written += 1
-    return written
+    rows: list[dict[str, Any]] = []
+    for trace_id, anns in by_trace.items():
+        if len(anns) < 2:
+            continue
+        disagreements: dict[str, list[tuple[str, object]]] = {}
+        for field_id in fields_to_adjudicate:
+            values = [(a.annotator_id, a.values.get(field_id)) for a in anns]
+            distinct = {_hashable(v) for _, v in values if v is not None}
+            if len(distinct) > 1:
+                disagreements[field_id] = values
+        if not disagreements:
+            continue
+        rows.append({
+            "trace_id": trace_id,
+            "rubric_version": anns[0].rubric_version,
+            "disagreements": disagreements,
+            "queue": "review-adjudication",
+            "sla_hours": 48,
+        })
+
+    # Build the whole payload before touching the output path, then swap in
+    # with an atomic rename. A crash mid-serialisation leaves the previous
+    # out_path (if any) untouched; readers never see a half-written file.
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with tmp_path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+    os.replace(tmp_path, out_path)
+    return len(rows)
 ```
 
 ### 2.5 `tests/test_prevalence_bias.py`

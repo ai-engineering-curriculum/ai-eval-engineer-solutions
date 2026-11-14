@@ -111,11 +111,13 @@ class RotationRFC:
 
 ```python
 """SQLite-backed gold set. Status history is append-only; retire is a state
-transition, not a delete."""
+transition, not a delete. Mutating calls run inside the caller's
+`transaction()` block so a full rotation commits or rolls back as a unit."""
 from __future__ import annotations
 import sqlite3
 import time
-from typing import Iterable
+from contextlib import contextmanager
+from typing import Iterable, Iterator
 
 from .schema import GoldItem
 
@@ -150,8 +152,31 @@ CREATE TABLE IF NOT EXISTS status_log (
 
 class GoldStore:
     def __init__(self, dsn: str) -> None:
-        self._conn = sqlite3.connect(dsn)
+        self._conn = sqlite3.connect(dsn, isolation_level="DEFERRED")
         self._conn.executescript(DDL)
+        self._conn.commit()
+        self._in_txn = False
+
+    @contextmanager
+    def transaction(self) -> Iterator["GoldStore"]:
+        """Atomic group of mutations. On exception, all changes roll back."""
+        if self._in_txn:
+            raise RuntimeError("nested GoldStore.transaction() is not supported")
+        self._in_txn = True
+        self._conn.execute("BEGIN")
+        try:
+            yield self
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+        finally:
+            self._in_txn = False
+
+    def _autocommit_if_needed(self) -> None:
+        if not self._in_txn:
+            self._conn.commit()
 
     def add(self, item: GoldItem) -> None:
         import json
@@ -166,7 +191,7 @@ class GoldStore:
                 item.retired_at_ns, item.retired_reason,
             ),
         )
-        self._conn.commit()
+        self._autocommit_if_needed()
 
     def retire(self, gold_id: str, actor: str, reason: str) -> None:
         now = time.time_ns()
@@ -183,7 +208,7 @@ class GoldStore:
             "INSERT INTO status_log VALUES (?,?,?,?,?,?)",
             (gold_id, now, "active", "retired", reason, actor),
         )
-        self._conn.commit()
+        self._autocommit_if_needed()
 
     def reclassify(self, gold_id: str, new_band: str, actor: str, reason: str) -> None:
         now = time.time_ns()
@@ -195,7 +220,7 @@ class GoldStore:
             "INSERT INTO status_log VALUES (?,?,?,?,?,?)",
             (gold_id, now, "active", "active", f"band:{new_band}:{reason}", actor),
         )
-        self._conn.commit()
+        self._autocommit_if_needed()
 
     def active_counts_by_band(self) -> dict[str, int]:
         rows = self._conn.execute(
@@ -208,9 +233,11 @@ class GoldStore:
 
 ```python
 """Execute a rotation plan. Validates band targets, runs the retire/add
-operations, and refuses to commit without the required sign-offs."""
+operations as a single atomic transaction, and refuses to commit without
+the required sign-offs."""
 from __future__ import annotations
 import json
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -277,17 +304,38 @@ def execute_rotation(
         missing = required - received
         raise RotationError(f"missing signoffs: {sorted(missing)}")
 
-    for gold_id in plan.retire:
-        store.retire(gold_id, actor="rotator", reason=f"{plan.rfc_id}:surface_change")
+    # Validate the plan before mutating. Catching these pre-transaction
+    # keeps the error path symmetric with the ratio check: either nothing
+    # is applied, or the whole plan is applied and validated.
+    missing_adds = [tid for tid in plan.add if tid not in adjudicated_items]
+    if missing_adds:
+        raise RotationError(f"missing replacement items: {sorted(missing_adds)}")
+    seen_add_ids: set[str] = set()
+    for tid in plan.add:
+        gold_id = adjudicated_items[tid].gold_id
+        if gold_id in seen_add_ids:
+            raise RotationError(f"duplicate gold_id in plan.add: {gold_id}")
+        seen_add_ids.add(gold_id)
 
-    for trace_id in plan.add:
-        item = adjudicated_items[trace_id]
-        store.add(item)
+    try:
+        with store.transaction():
+            for gold_id in plan.retire:
+                store.retire(gold_id, actor="rotator",
+                             reason=f"{plan.rfc_id}:surface_change")
 
-    for gold_id, new_band in plan.anchor_moves:
-        store.reclassify(gold_id, new_band, actor="rotator", reason=plan.rfc_id)
+            for trace_id in plan.add:
+                store.add(adjudicated_items[trace_id])
 
-    _validate_band_ratios(store, targets)
+            for gold_id, new_band in plan.anchor_moves:
+                store.reclassify(gold_id, new_band, actor="rotator",
+                                 reason=plan.rfc_id)
+
+            _validate_band_ratios(store, targets)
+    except sqlite3.IntegrityError as e:
+        # PK collision on `add` (duplicate gold_id already in store) rolls
+        # back the whole plan — surface it as a RotationError so callers
+        # treat it like the ratio check.
+        raise RotationError(f"rotation aborted: {e}") from e
 
 
 def _validate_band_ratios(store: GoldStore, targets: dict) -> None:

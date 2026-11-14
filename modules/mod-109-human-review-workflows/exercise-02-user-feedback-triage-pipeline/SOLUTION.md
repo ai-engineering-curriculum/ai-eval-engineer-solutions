@@ -295,6 +295,7 @@ class SeverityWeights:
     novelty_threshold: float
     dau_estimate: int
     thresholds: dict[str, float]   # {"P0": 0.85, "P1": 0.60, "P2": 0.30}
+    critical_harm_floor: float = 0.9   # harm >= floor forces severity to P0
 
 
 def load_weights(path: str) -> SeverityWeights:
@@ -323,6 +324,12 @@ def score_cluster(
         + weights.w_recency * recency
     )
     severity = min(1.0, max(0.0, severity))
+
+    # Critical-harm floor: a confirmed safety hit on even one user still
+    # pages. Without this, a novel PII-leak with blast≈1/DAU scores ~0.75
+    # and routes to the 24h P1 queue instead of the P0 2h/paged queue.
+    if harm >= weights.critical_harm_floor:
+        severity = max(severity, weights.thresholds["P0"])
 
     priority = "P3"
     for name, thr in sorted(weights.thresholds.items(), key=lambda x: -x[1]):
@@ -361,6 +368,7 @@ thresholds:
   P0: 0.85
   P1: 0.60
   P2: 0.30
+critical_harm_floor: 0.9         # harm_classifier_score >= floor forces P0
 ```
 
 ### 2.5 `feedback_triage/route.py` — stage 5

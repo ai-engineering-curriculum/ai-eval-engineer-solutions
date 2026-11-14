@@ -234,6 +234,10 @@ class ArgillaReviewAdapter:
                     "span_id": r.get("span_id", ""),
                     "surface": r.get("surface", "unknown"),
                     "priority": r.get("priority", "normal"),
+                    # Freeze the rubric version into the record so a later
+                    # rubric bump does not retroactively relabel this item
+                    # for exercise-03's IAA computation.
+                    "rubric_version": self._schema["rubric_version"],
                 },
                 external_id=r["trace_id"],   # idempotence key
             ))
@@ -242,12 +246,16 @@ class ArgillaReviewAdapter:
 
     def pull_annotations(self) -> list[dict[str, Any]]:
         ds = rg.FeedbackDataset.from_argilla(self._dataset_name)
+        current_version = self._schema["rubric_version"]
         out: list[dict[str, Any]] = []
         for r in ds.records:
+            record_meta = r.metadata or {}
+            rubric_version = record_meta.get("rubric_version") or current_version
             for response in r.responses or []:
                 out.append({
                     "trace_id": r.external_id,
                     "annotator_id": response.user_id,
+                    "rubric_version": rubric_version,
                     "submitted_ns": int(response.inserted_at.timestamp() * 1e9),
                     "values": {k: v.value for k, v in (response.values or {}).items()},
                     "status": response.status,     # submitted / draft / discarded
@@ -329,6 +337,7 @@ def main(out_path: Path, cfg: ArgillaConfig, schema_path: str) -> int:
                 continue
             canonical = {
                 "schema_version": CANONICAL_SCHEMA_VERSION,
+                "rubric_version": r["rubric_version"],
                 "trace_id": r["trace_id"],
                 "annotator_id": r["annotator_id"],
                 "submitted_ns": r["submitted_ns"],
