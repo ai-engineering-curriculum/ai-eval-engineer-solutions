@@ -9,3 +9,4 @@
 | 2026-11-12 | `fill-mod-107-online-eval-and-regression-solutions` | `mod-107-online-eval-and-regression` | Fill mod-107-online-eval-and-regression module exercise solutions |
 | 2026-11-15 | `fill-mod-110-eval-data-platform-slice-solutions` | `mod-110-eval-data-platform-slice` | Fill mod-110-eval-data-platform-slice module exercise solutions |
 | 2026-11-14 | `fill-mod-109-human-review-workflows-solutions` | `mod-109-human-review-workflows` | Fill mod-109-human-review-workflows module exercise solutions |
+| 2026-11-19 | `fill-mod-111-cost-latency-quality-tradeoff-solutions` | `mod-111-cost-latency-quality-tradeoff` | Fill mod-111-cost-latency-quality-tradeoff module exercise solutions |
